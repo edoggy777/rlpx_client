@@ -28,5 +28,5 @@ make clean && make install
 # Make gen-keys
 make gen-keys
 
-# Keys for Anvil if testing against geth then you will have to key that key
+# Keys for Anvil if testing against geth then you will have to get that key
 ./rlpx_client -k test_privkey.bin -P geth_test_pubkey.bin -h 127.0.0.1 -p 30303
