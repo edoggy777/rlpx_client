@@ -21,3 +21,12 @@ sudo apt install libsecp256k1-dev libssl-dev build-essential
 
 # Or use the Makefile helper
 make install-deps
+
+# Makefile
+make clean && make install
+
+# Make gen-keys
+make gen-keys
+
+# Keys for Anvil if testing against geth then you will have to key that key
+./rlpx_client -k test_privkey.bin -P geth_test_pubkey.bin -h 127.0.0.1 -p 30303
