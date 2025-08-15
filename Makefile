@@ -10,7 +10,7 @@ FUZZDIR = fuzz
 
 SOURCES = $(SRCDIR)/net.c $(SRCDIR)/crypto_ec.c $(SRCDIR)/keccak.c \
           $(SRCDIR)/aes_mac.c $(SRCDIR)/rlp.c $(SRCDIR)/rlpx_handshake.c \
-          $(SRCDIR)/rlpx_frame.c
+          $(SRCDIR)/rlpx_frame.c $(SRCDIR)/ecies.c
 
 OBJECTS = $(SOURCES:.c=.o)
 
