@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -std=c99 -g -O2
-INCLUDES = -Isrc/
-LIBS = -lsecp256k1 -lssl -lcrypto
+INCLUDES = -Isrc/ -I/usr/local/include
+LIBS = -L/usr/local/lib -lsecp256k1 -lssl -lcrypto
 
 # Source files
 SRCDIR = src

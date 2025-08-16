@@ -1,217 +1,261 @@
-// Add to src/ecies.c (new file)
-#include "rlpx_handshake.h"
-#include "crypto_ec.h"
-#include "keccak.h"
+// ecies.c
+#include "ecies.h"
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
+#include <openssl/rand.h>
+#include <openssl/sha.h>
+#include <openssl/crypto.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 
-// Ethereum ECIES implementation
-// Format: [ephemeral_pubkey_65_bytes][encrypted_data][mac_32_bytes]
+// Concat / X9.63 KDF (SHA-256)
+static int concat_kdf_sha256(const unsigned char *Z, size_t Z_len,
+                             const unsigned char *info, size_t info_len,
+                             unsigned char *out, size_t out_len) {
+    uint32_t counter = 1;
+    size_t generated = 0;
+    unsigned char hash[SHA256_DIGEST_LENGTH];
 
-int ecies_encrypt(const uint8_t pubkey[65], const uint8_t* plaintext, size_t plaintext_len, 
-                  uint8_t* ciphertext, size_t* ciphertext_len) {
+    while (generated < out_len) {
+        SHA256_CTX ctx;
+        SHA256_Init(&ctx);
+        unsigned char ctr[4] = {
+            (unsigned char)((counter >> 24) & 0xff),
+            (unsigned char)((counter >> 16) & 0xff),
+            (unsigned char)((counter >>  8) & 0xff),
+            (unsigned char)( counter        & 0xff)
+        };
+        SHA256_Update(&ctx, ctr, 4);
+        SHA256_Update(&ctx, Z, Z_len);
+        if (info && info_len) SHA256_Update(&ctx, info, info_len);
+        SHA256_Final(hash, &ctx);
+
+        size_t to_copy = (out_len - generated > sizeof(hash)) ? sizeof(hash) : (out_len - generated);
+        memcpy(out + generated, hash, to_copy);
+        generated += to_copy;
+        counter++;
+    }
+    OPENSSL_cleanse(hash, sizeof(hash));
+    return 1;
+}
+
+// ecies_encrypt:
+// out: R(65) || IV(16) || C(plaintext_len) || TAG(32)
+// caller must provide out_len with available buffer size; on success out_len is set to bytes written.
+// aad should be the 2-byte big-endian length prefix for the wire (auth-size) when used for RLPx auth.
+int ecies_encrypt(const uint8_t pubkey[65],
+                  const uint8_t *plaintext, size_t plaintext_len,
+                  const uint8_t *aad, size_t aad_len,
+                  uint8_t *out, size_t *out_len)
+{
     printf("DEBUG: Real ECIES encryption starting...\n");
-    
-    // Calculate required output size: 65 (ephemeral pubkey) + plaintext_len + 32 (MAC)
-    size_t required_len = 65 + plaintext_len + 32;
-    if (*ciphertext_len < required_len) {
-        printf("DEBUG: ECIES output buffer too small: %zu < %zu\n", *ciphertext_len, required_len);
+    size_t needed = 65 + 16 + plaintext_len + 32;
+    if (*out_len < needed) {
+        printf("DEBUG: ECIES output buffer too small: %zu < %zu\n", *out_len, needed);
         return -1;
     }
-    
-    // 1. Generate ephemeral keypair
-    uint8_t ephemeral_privkey[32];
-    uint8_t ephemeral_pubkey[65];
-    if (ec_generate_keypair(ephemeral_privkey, ephemeral_pubkey) != 0) {
+
+    // ephemeral keypair - caller must link with crypto_ec; but we will generate ephemeral using OpenSSL RAND + caller ec pub? 
+    // For simplicity we require caller supplies ephemeral generation function (but in this file we'll generate a keypair via libsecp256k1 through external API)
+    // To avoid coupling, we require the application provide ephemeral priv/pub via crypto_ec functions.
+    // But user prefed earlier ec_generate_keypair; we'll use it by declaring extern (weak coupling).
+    extern int ec_generate_keypair(uint8_t privkey[32], uint8_t pubkey[65]);
+    extern int ec_ecdh(const uint8_t privkey[32], const uint8_t pubkey[65], uint8_t shared[32]);
+
+    uint8_t eph_priv[32], eph_pub[65];
+    if (ec_generate_keypair(eph_priv, eph_pub) != 0) {
         printf("DEBUG: ECIES ephemeral key generation failed\n");
         return -1;
     }
-    
-    // 2. Compute shared secret using ECDH
-    uint8_t shared_secret[32];
-    if (ec_ecdh(ephemeral_privkey, pubkey, shared_secret) != 0) {
+
+    // ECDH X coordinate Z (32 bytes)
+    uint8_t Z[32];
+    if (ec_ecdh(eph_priv, pubkey, Z) != 0) {
         printf("DEBUG: ECIES ECDH failed\n");
         return -1;
     }
-    
-    // 3. Derive encryption and MAC keys using KDF
-    // Ethereum uses: keccak256(shared_secret || 0x00000001) for encryption key
-    // keccak256(shared_secret || 0x00000002) for MAC key
-    uint8_t kdf_input[36]; // 32 + 4
-    memcpy(kdf_input, shared_secret, 32);
-    
-    // Derive encryption key
-    uint32_t counter = 0x00000001;
-    memcpy(kdf_input + 32, &counter, 4);
-    uint8_t enc_key[32];
-    keccak256(kdf_input, 36, enc_key);
-    
-    // Derive MAC key  
-    counter = 0x00000002;
-    memcpy(kdf_input + 32, &counter, 4);
-    uint8_t mac_key[32];
-    keccak256(kdf_input, 36, mac_key);
-    
-    printf("DEBUG: ECIES keys derived\n");
-    
-    // 4. Encrypt plaintext using AES-128-CTR
+
+    // KDF: produce 32 bytes -> kE(16) | kM(16)
+    unsigned char kmat[32];
+    if (!concat_kdf_sha256(Z, 32, NULL, 0, kmat, sizeof(kmat))) {
+        printf("DEBUG: KDF failed\n");
+        return -1;
+    }
+    unsigned char *kE = kmat;
+    unsigned char *kM = kmat + 16;
+
+    // random IV 16 bytes
+    unsigned char iv[16];
+    if (RAND_bytes(iv, sizeof(iv)) != 1) {
+        printf("DEBUG: RAND_bytes failed\n");
+        OPENSSL_cleanse(kmat, sizeof(kmat));
+        return -1;
+    }
+
+    // AES-128-CTR encrypt
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     if (!ctx) {
-        printf("DEBUG: ECIES AES context creation failed\n");
+        OPENSSL_cleanse(kmat, sizeof(kmat));
         return -1;
     }
-    
-    // Use first 16 bytes of enc_key for AES-128
-    uint8_t iv[16] = {0}; // Zero IV for CTR mode
-    if (EVP_EncryptInit_ex(ctx, EVP_aes_128_ctr(), NULL, enc_key, iv) != 1) {
-        printf("DEBUG: ECIES AES init failed\n");
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_128_ctr(), NULL, kE, iv) != 1) {
         EVP_CIPHER_CTX_free(ctx);
+        OPENSSL_cleanse(kmat, sizeof(kmat));
         return -1;
     }
-    
-    // Copy ephemeral public key to output
-    memcpy(ciphertext, ephemeral_pubkey, 65);
-    
-    // Encrypt the plaintext
-    int encrypted_len;
-    if (EVP_EncryptUpdate(ctx, ciphertext + 65, &encrypted_len, plaintext, plaintext_len) != 1) {
-        printf("DEBUG: ECIES AES encryption failed\n");
+
+    uint8_t *p = out;
+    memcpy(p, eph_pub, 65); p += 65;
+    memcpy(p, iv, 16); p += 16;
+
+    int outl = 0, outf = 0;
+    if (EVP_EncryptUpdate(ctx, p, &outl, plaintext, (int)plaintext_len) != 1) {
         EVP_CIPHER_CTX_free(ctx);
+        OPENSSL_cleanse(kmat, sizeof(kmat));
         return -1;
     }
-    
-    int final_len;
-    if (EVP_EncryptFinal_ex(ctx, ciphertext + 65 + encrypted_len, &final_len) != 1) {
-        printf("DEBUG: ECIES AES finalization failed\n");
+    if (EVP_EncryptFinal_ex(ctx, p + outl, &outf) != 1) {
         EVP_CIPHER_CTX_free(ctx);
+        OPENSSL_cleanse(kmat, sizeof(kmat));
         return -1;
     }
-    
+    size_t c_len = (size_t)(outl + outf);
+    p += c_len;
     EVP_CIPHER_CTX_free(ctx);
-    
-    printf("DEBUG: ECIES AES encryption completed, encrypted_len: %d\n", encrypted_len);
-    
-    // 5. Calculate MAC over ephemeral_pubkey + encrypted_data
-    size_t mac_input_len = 65 + plaintext_len;
-    uint8_t mac_hash[32];
-    
-    unsigned int hmac_len = 32;
-    if (HMAC(EVP_sha256(), mac_key, 32, ciphertext, mac_input_len, mac_hash, &hmac_len) == NULL) {
-        printf("DEBUG: ECIES MAC calculation failed\n");
+
+    // HMAC-SHA256 keyed by SHA256(kM), input = AAD || IV || C
+    unsigned char mac_key32[32];
+    SHA256(kM, 16, mac_key32);
+
+    unsigned char tag[32];
+    unsigned int taglen = 0;
+    HMAC_CTX *h = HMAC_CTX_new();
+    if (!h) {
+        OPENSSL_cleanse(kmat, sizeof(kmat));
+        OPENSSL_cleanse(mac_key32, sizeof(mac_key32));
         return -1;
     }
-    
-    // Copy MAC to output
-    memcpy(ciphertext + 65 + plaintext_len, mac_hash, 32);
-    
-    *ciphertext_len = required_len;
-    printf("DEBUG: ECIES encryption completed successfully, output length: %zu\n", *ciphertext_len);
-    
+    HMAC_Init_ex(h, mac_key32, sizeof(mac_key32), EVP_sha256(), NULL);
+    if (aad && aad_len) HMAC_Update(h, aad, aad_len);
+    HMAC_Update(h, iv, sizeof(iv));
+    // ciphertext is at out + 65 + 16
+    HMAC_Update(h, out + 65 + 16, c_len);
+    HMAC_Final(h, tag, &taglen);
+    HMAC_CTX_free(h);
+
+    memcpy(p, tag, 32);
+    p += 32;
+
+    *out_len = (size_t)(p - out);
+
+    // cleanse temporary secrets
+    OPENSSL_cleanse(kmat, sizeof(kmat));
+    OPENSSL_cleanse(mac_key32, sizeof(mac_key32));
+    OPENSSL_cleanse(Z, sizeof(Z));
+    OPENSSL_cleanse(eph_priv, sizeof(eph_priv));
+
+    printf("DEBUG: ECIES encryption completed, out_len=%zu\n", *out_len);
     return 0;
 }
 
-int ecies_decrypt(const uint8_t privkey[32], const uint8_t* ciphertext, size_t ciphertext_len,
-                  uint8_t* plaintext, size_t* plaintext_len) {
+int ecies_decrypt(const uint8_t privkey[32],
+                  const uint8_t *in, size_t in_len,
+                  const uint8_t *aad, size_t aad_len,
+                  uint8_t *plaintext, size_t *plaintext_len)
+{
     printf("DEBUG: Real ECIES decryption starting...\n");
-    
-    // Minimum size: 65 (ephemeral pubkey) + 32 (MAC) = 97 bytes
-    if (ciphertext_len < 97) {
-        printf("DEBUG: ECIES ciphertext too short: %zu\n", ciphertext_len);
+    if (in_len < 65 + 16 + 32) {
+        printf("DEBUG: ECIES ciphertext too short: %zu\n", in_len);
         return -1;
     }
-    
-    size_t encrypted_data_len = ciphertext_len - 65 - 32;
-    if (*plaintext_len < encrypted_data_len) {
-        printf("DEBUG: ECIES plaintext buffer too small: %zu < %zu\n", *plaintext_len, encrypted_data_len);
+
+    const uint8_t *R = in;
+    const uint8_t *iv = in + 65;
+    const uint8_t *C = in + 65 + 16;
+    size_t c_len = in_len - (65 + 16 + 32);
+    const uint8_t *tag = in + 65 + 16 + c_len;
+
+    // ECDH
+    extern int ec_ecdh(const uint8_t privkey[32], const uint8_t pubkey[65], uint8_t shared[32]);
+    uint8_t Z[32];
+    if (ec_ecdh(privkey, R, Z) != 0) {
+        printf("DEBUG: ECIES ECDH failed\n");
         return -1;
     }
-    
-    // 1. Extract ephemeral public key
-    const uint8_t* ephemeral_pubkey = ciphertext;
-    const uint8_t* encrypted_data = ciphertext + 65;
-    const uint8_t* received_mac = ciphertext + 65 + encrypted_data_len;
-    
-    // 2. Compute shared secret using ECDH
-    uint8_t shared_secret[32];
-    if (ec_ecdh(privkey, ephemeral_pubkey, shared_secret) != 0) {
-        printf("DEBUG: ECIES ECDH decryption failed\n");
+
+    unsigned char kmat[32];
+    if (!concat_kdf_sha256(Z, 32, NULL, 0, kmat, sizeof(kmat))) {
+        printf("DEBUG: KDF failed\n");
         return -1;
     }
-    
-    // 3. Derive encryption and MAC keys (same as encryption)
-    uint8_t kdf_input[36];
-    memcpy(kdf_input, shared_secret, 32);
-    
-    // Derive encryption key
-    uint32_t counter = 0x00000001;
-    memcpy(kdf_input + 32, &counter, 4);
-    uint8_t enc_key[32];
-    keccak256(kdf_input, 36, enc_key);
-    
-    // Derive MAC key
-    counter = 0x00000002;
-    memcpy(kdf_input + 32, &counter, 4);
-    uint8_t mac_key[32];
-    keccak256(kdf_input, 36, mac_key);
-    
-    // 4. Verify MAC
-    uint8_t computed_mac[32];
-    unsigned int hmac_len = 32;
-    size_t mac_input_len = 65 + encrypted_data_len;
-    
-    if (HMAC(EVP_sha256(), mac_key, 32, ciphertext, mac_input_len, computed_mac, &hmac_len) == NULL) {
-        printf("DEBUG: ECIES MAC computation failed\n");
+    unsigned char *kE = kmat;
+    unsigned char *kM = kmat + 16;
+
+    // recompute HMAC
+    unsigned char mac_key32[32];
+    SHA256(kM, 16, mac_key32);
+
+    unsigned char tag_calc[32];
+    unsigned int taglen = 0;
+    HMAC_CTX *h = HMAC_CTX_new();
+    if (!h) {
+        OPENSSL_cleanse(kmat, sizeof(kmat));
         return -1;
     }
-    
-    // Constant-time MAC comparison
-    int mac_valid = 1;
-    for (int i = 0; i < 32; i++) {
-        mac_valid &= (computed_mac[i] == received_mac[i]);
-    }
-    
-    if (!mac_valid) {
-        printf("DEBUG: ECIES MAC verification failed\n");
+    HMAC_Init_ex(h, mac_key32, sizeof(mac_key32), EVP_sha256(), NULL);
+    if (aad && aad_len) HMAC_Update(h, aad, aad_len);
+    HMAC_Update(h, iv, 16);
+    HMAC_Update(h, C, c_len);
+    HMAC_Final(h, tag_calc, &taglen);
+    HMAC_CTX_free(h);
+
+    if (CRYPTO_memcmp(tag_calc, tag, 32) != 0) {
+        printf("DEBUG: ECIES MAC mismatch\n");
+        OPENSSL_cleanse(kmat, sizeof(kmat));
+        OPENSSL_cleanse(mac_key32, sizeof(mac_key32));
         return -1;
     }
-    
-    printf("DEBUG: ECIES MAC verification successful\n");
-    
-    // 5. Decrypt data using AES-128-CTR
+
+    // AES-128-CTR decrypt
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     if (!ctx) {
-        printf("DEBUG: ECIES AES context creation failed\n");
+        OPENSSL_cleanse(kmat, sizeof(kmat));
+        OPENSSL_cleanse(mac_key32, sizeof(mac_key32));
         return -1;
     }
-    
-    uint8_t iv[16] = {0}; // Zero IV for CTR mode
-    if (EVP_DecryptInit_ex(ctx, EVP_aes_128_ctr(), NULL, enc_key, iv) != 1) {
-        printf("DEBUG: ECIES AES decrypt init failed\n");
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_128_ctr(), NULL, kE, iv) != 1) {
         EVP_CIPHER_CTX_free(ctx);
+        OPENSSL_cleanse(kmat, sizeof(kmat));
+        OPENSSL_cleanse(mac_key32, sizeof(mac_key32));
         return -1;
     }
-    
-    int decrypted_len;
-    if (EVP_DecryptUpdate(ctx, plaintext, &decrypted_len, encrypted_data, encrypted_data_len) != 1) {
-        printf("DEBUG: ECIES AES decryption failed\n");
+    if (*plaintext_len < c_len) {
         EVP_CIPHER_CTX_free(ctx);
+        OPENSSL_cleanse(kmat, sizeof(kmat));
+        OPENSSL_cleanse(mac_key32, sizeof(mac_key32));
         return -1;
     }
-    
-    int final_len;
-    if (EVP_DecryptFinal_ex(ctx, plaintext + decrypted_len, &final_len) != 1) {
-        printf("DEBUG: ECIES AES finalization failed\n");
+    int outl = 0, outf = 0;
+    if (EVP_DecryptUpdate(ctx, plaintext, &outl, C, (int)c_len) != 1) {
         EVP_CIPHER_CTX_free(ctx);
+        OPENSSL_cleanse(kmat, sizeof(kmat));
+        OPENSSL_cleanse(mac_key32, sizeof(mac_key32));
         return -1;
     }
-    
+    if (EVP_DecryptFinal_ex(ctx, plaintext + outl, &outf) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        OPENSSL_cleanse(kmat, sizeof(kmat));
+        OPENSSL_cleanse(mac_key32, sizeof(mac_key32));
+        return -1;
+    }
     EVP_CIPHER_CTX_free(ctx);
-    
-    *plaintext_len = decrypted_len + final_len;
-    printf("DEBUG: ECIES decryption completed successfully, plaintext length: %zu\n", *plaintext_len);
-    
+
+    *plaintext_len = (size_t)(outl + outf);
+
+    OPENSSL_cleanse(kmat, sizeof(kmat));
+    OPENSSL_cleanse(mac_key32, sizeof(mac_key32));
+    OPENSSL_cleanse(Z, sizeof(Z));
     return 0;
 }
+

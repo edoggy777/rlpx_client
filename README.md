@@ -25,8 +25,6 @@ make install-deps
 # Makefile
 make clean && make install
 
-# Make gen-keys
-make gen-keys
 
-# Keys for Anvil if testing against geth then you will have to get that key
+# You will need test_privkey.bin (private key), test_pubkey.bin, and geth_test_pubkey.bin 
 ./rlpx_client -k test_privkey.bin -P geth_test_pubkey.bin -h 127.0.0.1 -p 30303
