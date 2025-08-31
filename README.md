@@ -23,7 +23,7 @@ sudo apt install libsecp256k1-dev libssl-dev build-essential
 make install-deps
 
 # Makefile
-make clean && make install
+make clean && make
 
 
 # You will need test_privkey.bin (private key), test_pubkey.bin, and geth_test_pubkey.bin 
