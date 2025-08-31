@@ -1,81 +1,73 @@
-#include "net.h"
 #include <stdio.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <errno.h>
-#include <poll.h>
-#include <string.h>
-#include <sys/time.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 int net_connect(const char* host, uint16_t port) {
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) return -1;
-    
-    struct sockaddr_in addr = {0};
+    if (sockfd < 0) {
+        perror("socket() failed");
+        return -1;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
+
     if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+        fprintf(stderr, "inet_pton() failed for %s\n", host);
         close(sockfd);
         return -1;
     }
-    
+
     if (connect(sockfd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+        perror("connect() failed");
         close(sockfd);
         return -1;
     }
-    
+
+    printf("DEBUG: connected to %s:%u (sockfd=%d)\n", host, port, sockfd);
     return sockfd;
 }
 
-ssize_t net_send_all(int fd, const void* data, size_t len) {
-    const uint8_t* ptr = (const uint8_t*)data;
-    size_t sent = 0;
-    
-    while (sent < len) {
-        ssize_t result = send(fd, ptr + sent, len - sent, 0);
-        if (result <= 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+ssize_t net_recv_exact(int sockfd, uint8_t* buf, size_t len, int timeout_ms) {
+    size_t total = 0;
+    while (total < len) {
+        ssize_t n = recv(sockfd, buf + total, len - total, 0);
+        if (n < 0) {
+            perror("recv() failed");
             return -1;
         }
-        sent += result;
-    }
-    return sent;
-}
-
-ssize_t net_recv_exact(int sockfd, uint8_t* data, size_t len, int timeout_ms) {
-    struct timeval tv = { .tv_sec = timeout_ms / 1000, .tv_usec = (timeout_ms % 1000) * 1000 };
-    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
-        perror("DEBUG: setsockopt failed");
-        return -1;
-    }
-    size_t got = 0;
-    while (got < len) {
-        ssize_t r = recv(sockfd, data + got, len - got, 0);
-        if (r <= 0) {
-            perror("DEBUG: recv failed");
+        if (n == 0) {
+            fprintf(stderr, "DEBUG: recv() returned 0 (peer closed connection)\n");
             return -1;
         }
-        got += r;
+        total += n;
     }
-    return got;
+    return total;
 }
 
-ssize_t net_recv_available(int fd, void* data, size_t max_len, int timeout_ms) {
-    struct pollfd pfd = {fd, POLLIN, 0};
-    
-    // Wait for data to be available
-    int poll_result = poll(&pfd, 1, timeout_ms);
-    if (poll_result <= 0) {
-        return -1; // timeout or error
+
+ssize_t net_send_all(int sockfd, const uint8_t* buf, size_t len) {
+    size_t total_sent = 0;
+    while (total_sent < len) {
+        ssize_t sent = send(sockfd, buf + total_sent, len - total_sent, 0);
+        if (sent <= 0) {
+            if (sent < 0 && errno == EINTR) continue; // interrupted, retry
+            return -1; // error or closed connection
+        }
+        total_sent += sent;
     }
-    
-    // Receive whatever data is available
-    ssize_t result = recv(fd, data, max_len, 0);
-    return result; // Return actual bytes received (or -1 on error)
+    return total_sent;
 }
 
-void net_close(int fd) {
-    if (fd >= 0) close(fd);
+void net_close(int sockfd) {
+    if (sockfd >= 0) close(sockfd);
 }
+
