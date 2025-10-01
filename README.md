@@ -1,3 +1,11 @@
+## Support
+
+If you find this project helpful, consider supporting it:
+
+**Bitcoin:** `338dgCgrg6Sm1UdP6dCdL6BrNiU7NQjkA7`
+
+[Donate with Bitcoin](bitcoin:338dgCgrg6Sm1UdP6dCdL6BrNiU7NQjkA7)
+
 # Minimal RLPx Client in C
 
 A minimal, external C implementation of the Ethereum devp2p RLPx protocol for testing, fuzzing, and research purposes.
@@ -28,3 +36,5 @@ make clean && make
 
 # You will need test_privkey.bin (private key), test_pubkey.bin, and geth_test_pubkey.bin 
 ./rlpx_client -k test_privkey.bin -P geth_test_pubkey.bin -h 127.0.0.1 -p 30303
+
+
