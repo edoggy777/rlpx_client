@@ -59,23 +59,13 @@ static int ecdh_raw_x(unsigned char* output, const unsigned char* x, const unsig
 
 int ec_ecdh(const uint8_t privkey[32], const uint8_t pubkey_bytes[65], uint8_t shared[32]) {
     init_secp256k1();
-    printf("DEBUG: ECDH with privkey: ");
-    for (int i = 0; i < 32; i++) printf("%02x", privkey[i]);
-    printf("\nDEBUG: Pubkey: ");
-    for (int i = 0; i < 65; i++) printf("%02x", pubkey_bytes[i]);
-    printf("\n");
     secp256k1_pubkey pub;
     if (!secp256k1_ec_pubkey_parse(ctx, &pub, pubkey_bytes, 65)) {
-        printf("DEBUG: secp256k1_ec_pubkey_parse failed\n");
         return -1;
     }
     if (!secp256k1_ecdh(ctx, shared, &pub, privkey, ecdh_raw_x, NULL)) {
-        printf("DEBUG: secp256k1_ecdh failed\n");
         return -1;
     }
-    printf("DEBUG: ECDH shared secret: ");
-    for (int i = 0; i < 32; i++) printf("%02x", shared[i]);
-    printf("\n");
     return 0;
 }
 

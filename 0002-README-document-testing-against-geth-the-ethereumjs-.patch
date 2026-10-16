@@ -1,0 +1,62 @@
+From ed3220d7941876c30393162053ad1db8c82f4662 Mon Sep 17 00:00:00 2001
+From: evan <kirtzevan@gmail.com>
+Date: Fri, 16 Oct 2026 09:15:55 -0700
+Subject: [PATCH 2/2] README: document testing against geth, the ethereumjs
+ test peer, and applying the patch
+
+Co-Authored-By: Claude Mythos 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015T3rS29gR18bxCjuU5uCSo
+---
+ README.md | 36 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/README.md b/README.md
+index 3bde71d..0c335b4 100644
+--- a/README.md
++++ b/README.md
+@@ -67,6 +67,42 @@ Snappy compression is enabled automatically when the peer speaks p2p v5+.
+ Pings are answered with Pong; the peer's eth Status is printed. (No eth Status
+ is sent back by default, so real nodes drop the session after their timeout.)
+ 
++### Testing against a real geth node
++
++```bash
++# terminal 1: a local geth with a fixed node key (no discovery, no peers needed)
++geth --nodiscover --maxpeers 5 --nodekeyhex a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
++# look for:  Started P2P networking  self="enode://<128 hex>@127.0.0.1:30303?discport=0"
++
++# terminal 2: dial it (quote the URL because of the ?discport part)
++./rlpx_client -e 'enode://<128 hex>@127.0.0.1:30303' -n 3
++```
++
++Expected output: `✓ RLPx handshake successful`, geth's Hello (`Geth/v1.x...`,
++capabilities `eth/68 snap/1`), then `<- eth Status`. Geth will send a Disconnect
++after its timeout because we don't answer the Status - that's normal.
++
++### Testing without geth
++
++`tests/peer.mjs` is a small listening node built on `@ethereumjs/devp2p`:
++
++```bash
++mkdir /tmp/peer && cd /tmp/peer
++npm i @ethereumjs/devp2p @ethereumjs/util @ethereumjs/common
++node /path/to/rlpx_client/tests/peer.mjs      # prints "peer node id: 0x..."
++./rlpx_client -P <that id without 0x> -n 3
++```
++
++### Applying a patch from a release
++
++If you got the fix as a `0001-*.patch` file instead of pulling from git:
++
++```bash
++git clone https://github.com/edoggy777/rlpx_client.git && cd rlpx_client
++git am /path/to/0001-Fix-RLPx-implementation-so-it-completes-a-real-hands.patch
++make clean && make && make test
++```
++
+ ### Tested against
+ 
+ The handshake, framing and Hello exchange were verified against
+-- 
+2.43.0
+

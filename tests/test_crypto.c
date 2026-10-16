@@ -21,6 +21,25 @@ void test_keccak_known_vectors() {
     printf("✓ Keccak-256 test vector passed\n");
 }
 
+void test_keccak_incremental() {
+    // incremental API must match one-shot and digest must be non-destructive
+    uint8_t data[300];
+    for (int i = 0; i < 300; i++) data[i] = (uint8_t)i;
+    uint8_t one[32], inc[32], again[32];
+    keccak256(data, 300, one);
+    keccak_ctx_t c;
+    keccak_init(&c);
+    keccak_update(&c, data, 100);
+    keccak_update(&c, data + 100, 200);
+    keccak_digest(&c, inc);
+    keccak_digest(&c, again);
+    assert(memcmp(one, inc, 32) == 0 && memcmp(inc, again, 32) == 0);
+    // keccak256("") = c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470
+    keccak256(data, 0, one);
+    assert(one[0] == 0xc5 && one[1] == 0xd2 && one[31] == 0x70);
+    printf("✓ Keccak incremental test passed\n");
+}
+
 void test_ecdh_consistency() {
     uint8_t alice_priv[32], alice_pub[65];
     uint8_t bob_priv[32], bob_pub[65];
@@ -38,6 +57,7 @@ void test_ecdh_consistency() {
 
 int main() {
     test_keccak_known_vectors();
+    test_keccak_incremental();
     test_ecdh_consistency();
     printf("All crypto tests passed!\n");
     return 0;

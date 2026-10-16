@@ -90,7 +90,7 @@ void run_structured_fuzzing(rlpx_conn_t* conn) {
             uint8_t response[1024];
             size_t resp_len = sizeof(response);
             
-            if (rlpx_recv_frame(conn, response, &resp_len) == 0) {
+            if (rlpx_recv_frame(conn, response, &resp_len, 5000) == 0) {
                 printf("  ✓ Received %zu byte response\n", resp_len);
             } else {
                 printf("  ⚠ No response (connection may be closed)\n");
@@ -141,7 +141,7 @@ void run_random_fuzzing(rlpx_conn_t* conn, int iterations) {
             // Try to receive (with short timeout)
             uint8_t response[1024];
             size_t resp_len = sizeof(response);
-            rlpx_recv_frame(conn, response, &resp_len); // Ignore result
+            rlpx_recv_frame(conn, response, &resp_len, 5000); // Ignore result
         } else {
             // Connection lost, try to reconnect
             printf("  Connection lost, attempting reconnect...\n");

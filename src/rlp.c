@@ -80,6 +80,78 @@ size_t rlp_encode_uint8(uint8_t value, uint8_t* output) {
     return rlp_encode_bytes(&value, 1, output);
 }
 
+size_t rlp_encode_list_raw(const uint8_t* payload, size_t payload_len, uint8_t* output) {
+    size_t offset;
+    if (payload_len <= 55) {
+        output[0] = 0xc0 + payload_len;
+        offset = 1;
+    } else if (payload_len <= 0xFF) {
+        output[0] = 0xf8;
+        output[1] = (uint8_t)payload_len;
+        offset = 2;
+    } else if (payload_len <= 0xFFFF) {
+        output[0] = 0xf9;
+        output[1] = (payload_len >> 8) & 0xff;
+        output[2] = payload_len & 0xff;
+        offset = 3;
+    } else {
+        return 0;
+    }
+    memmove(output + offset, payload, payload_len);
+    return offset + payload_len;
+}
+
+size_t rlp_encode_uint(uint64_t value, uint8_t* output) {
+    if (value == 0) {
+        output[0] = 0x80;
+        return 1;
+    }
+    uint8_t be[8];
+    int n = 0;
+    for (int i = 7; i >= 0; i--) {
+        uint8_t b = (uint8_t)(value >> (8 * i));
+        if (n == 0 && b == 0) continue;
+        be[n++] = b;
+    }
+    return rlp_encode_bytes(be, n, output);
+}
+
+size_t rlp_parse(const uint8_t* input, size_t len, int* is_list,
+                 const uint8_t** payload, size_t* payload_len) {
+    if (len == 0) return 0;
+    uint8_t first = input[0];
+    size_t hdr, plen;
+    if (first < 0x80) {
+        *is_list = 0; *payload = input; *payload_len = 1;
+        return 1;
+    } else if (first <= 0xb7) {
+        *is_list = 0; hdr = 1; plen = first - 0x80;
+    } else if (first <= 0xbf) {
+        *is_list = 0; hdr = 1 + (first - 0xb7);
+        if (len < hdr) return 0;
+        plen = 0;
+        for (size_t i = 1; i < hdr; i++) plen = (plen << 8) | input[i];
+    } else if (first <= 0xf7) {
+        *is_list = 1; hdr = 1; plen = first - 0xc0;
+    } else {
+        *is_list = 1; hdr = 1 + (first - 0xf7);
+        if (len < hdr) return 0;
+        plen = 0;
+        for (size_t i = 1; i < hdr; i++) plen = (plen << 8) | input[i];
+    }
+    if (hdr + plen > len) return 0;
+    *payload = input + hdr;
+    *payload_len = plen;
+    return hdr + plen;
+}
+
+uint64_t rlp_bytes_to_uint(const uint8_t* b, size_t len) {
+    uint64_t v = 0;
+    if (len > 8) len = 8;
+    for (size_t i = 0; i < len; i++) v = (v << 8) | b[i];
+    return v;
+}
+
 // FIXED: Complete RLP decode implementation
 int rlp_decode_item(const uint8_t* input, size_t len, uint8_t** data, size_t* data_len) {
     if (len == 0) return -1;
@@ -137,7 +209,7 @@ int rlp_decode_list(const uint8_t* input, size_t len, uint8_t*** items, size_t**
         // Short list
         payload_len = first - 0xc0;
         payload_start = 1;
-    } else if (first >= 0xf8 && first <= 0xff) {
+    } else if (first >= 0xf8) {
         // Long list
         size_t len_of_len = first - 0xf7;
         if (len < 1 + len_of_len) return -1;

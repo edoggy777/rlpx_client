@@ -1,6 +1,6 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c99 -g -O2 -Isrc
-LDFLAGS = -lssl -lcrypto -lsecp256k1
+CFLAGS = -Wall -Wextra -std=gnu99 -g -O2 -Isrc -Wno-deprecated-declarations
+LDFLAGS = -L/usr/local/lib -lssl -lcrypto -lsecp256k1
 
 # Source directory
 SRCDIR = src
@@ -28,7 +28,7 @@ $(SRCDIR)/%.o: $(SRCDIR)/%.c
 
 # Clean target
 clean:
-	rm -f $(OBJECTS) $(TARGET)
+	rm -f $(OBJECTS) $(FUZZER_OBJECTS) $(TARGET) rlpx_fuzzer tests/test_crypto tests/test_rlp tests/test_handshake
 
 # Show what files will be compiled
 show-files:
@@ -59,4 +59,11 @@ debug: $(TARGET)
 fuzzer: $(FUZZER_OBJECTS)
 	$(CC) $(FUZZER_OBJECTS) -o rlpx_fuzzer $(LDFLAGS)
 
-.PHONY: all clean show-files install-deps test-build debug fuzzer
+.PHONY: all clean show-files install-deps test-build debug fuzzer test
+
+# Unit tests
+TEST_OBJECTS = $(filter-out $(SRCDIR)/main.o, $(OBJECTS))
+test: $(TEST_OBJECTS)
+	@for t in crypto rlp handshake; do \
+		$(CC) $(CFLAGS) tests/test_$$t.c $(TEST_OBJECTS) -o tests/test_$$t $(LDFLAGS) && ./tests/test_$$t || exit 1; \
+	done

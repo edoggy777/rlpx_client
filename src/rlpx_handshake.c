@@ -1,4 +1,8 @@
-// rlpx_handshake.c - FIXED VERSION
+// rlpx_handshake.c - EIP-8 RLPx handshake (initiator side)
+//
+// auth-body = rlp[sig, initiator-pubk, initiator-nonce, auth-vsn] || padding
+// auth      = auth-size || ecies(auth-body, aad = auth-size)
+// ack-body  = rlp[recipient-ephemeral-pubk, recipient-nonce, ack-vsn] || padding
 #include "rlpx_handshake.h"
 #include "crypto_ec.h"
 #include "ecies.h"
@@ -8,292 +12,293 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <stdint.h>
+#include <ctype.h>
 #include <openssl/crypto.h>
+#include <openssl/rand.h>
 #include <secp256k1.h>
 
+// ---------------------------------------------------------------- key loading
+
+static int hex_decode(const char* hex, uint8_t* out, size_t out_len) {
+    if (strncmp(hex, "0x", 2) == 0) hex += 2;
+    if (strlen(hex) != out_len * 2) return -1;
+    for (size_t i = 0; i < out_len; i++) {
+        unsigned v;
+        if (!isxdigit((unsigned char)hex[2 * i]) || !isxdigit((unsigned char)hex[2 * i + 1])) return -1;
+        if (sscanf(hex + 2 * i, "%2x", &v) != 1) return -1;
+        out[i] = (uint8_t)v;
+    }
+    return 0;
+}
+
+// Accepts: raw binary file of exactly `len` bytes, a file containing hex, or a
+// hex string given directly on the command line.
+static int load_bytes(const char* file_or_hex, uint8_t* out, size_t len) {
+    FILE* f = fopen(file_or_hex, "rb");
+    if (!f) return hex_decode(file_or_hex, out, len);
+
+    uint8_t buf[512];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == len) {
+        memcpy(out, buf, len);
+        return 0;
+    }
+    buf[n] = 0;
+    while (n > 0 && isspace(buf[n - 1])) buf[--n] = 0;
+    return hex_decode((const char*)buf, out, len);
+}
+
+int rlpx_load_privkey(const char* file_or_hex, uint8_t out[32]) {
+    if (load_bytes(file_or_hex, out, 32) != 0) return -1;
+    return secp256k1_ec_seckey_verify(ctx, out) ? 0 : -1;
+}
+
+int rlpx_load_pubkey(const char* file_or_hex, uint8_t out[65]) {
+    // enode://<128 hex>@host:port is also accepted
+    const char* s = file_or_hex;
+    char tmp[129];
+    if (strncmp(s, "enode://", 8) == 0) {
+        s += 8;
+        const char* at = strchr(s, '@');
+        size_t n = at ? (size_t)(at - s) : strlen(s);
+        if (n != 128) return -1;
+        memcpy(tmp, s, 128);
+        tmp[128] = 0;
+        s = tmp;
+    }
+    if (load_bytes(s, out + 1, 64) != 0) return -1;
+    out[0] = 0x04;
+    secp256k1_pubkey pub;
+    return secp256k1_ec_pubkey_parse(ctx, &pub, out, 65) ? 0 : -1;
+}
+
+// ---------------------------------------------------------------- init
+
 int rlpx_init(rlpx_conn_t* conn, const char* static_privkey_file) {
-    printf("DEBUG: Initializing RLPx connection with privkey file: %s\n", static_privkey_file);
     memset(conn, 0, sizeof(*conn));
     conn->state = RLPX_STATE_INIT;
     conn->sockfd = -1;
 
-    // Read static private key from file
-    int fd = open(static_privkey_file, O_RDONLY);
-    if (fd >= 0) {
-        ssize_t r = read(fd, conn->static_privkey, 32);
-        close(fd);
-        if (r != 32) {
-            printf("DEBUG: Failed to read 32 bytes from privkey file, got %zd\n", r);
-            return -1;
-        }
-        // Verify the private key
-        if (!secp256k1_ec_seckey_verify(ctx, conn->static_privkey)) {
-            printf("DEBUG: Invalid secp256k1 private key\n");
-            return -1;
-        }
+    // make sure libsecp256k1 context exists before we use it
+    uint8_t dummy_pub[65];
+    uint8_t dummy_priv[32] = {0};
+    dummy_priv[31] = 1;
+    ec_pubkey_from_privkey(dummy_priv, dummy_pub);
+
+    if (static_privkey_file && rlpx_load_privkey(static_privkey_file, conn->static_privkey) == 0) {
+        // loaded
     } else {
-        printf("DEBUG: Cannot open privkey file: %s\n", static_privkey_file);
-        // Fallback placeholder (not recommended for production)
-        for (int i = 0; i < 32; ++i) conn->static_privkey[i] = 0x42;
+        if (static_privkey_file)
+            fprintf(stderr, "Could not load private key from '%s'; generating a random one\n",
+                    static_privkey_file);
+        if (ec_generate_keypair(conn->static_privkey, conn->static_pubkey) != 0) return -1;
     }
-    ec_pubkey_from_privkey(conn->static_privkey, conn->static_pubkey);
+    if (ec_pubkey_from_privkey(conn->static_privkey, conn->static_pubkey) != 0) return -1;
     return 0;
 }
+
+// ---------------------------------------------------------------- auth
 
 int rlpx_create_auth(rlpx_conn_t* conn, uint8_t* auth_msg, size_t* auth_len) {
-    printf("DEBUG: Creating auth message...\n");
+    // 1) ephemeral keypair + nonce
+    if (ec_generate_keypair(conn->ephemeral_privkey, conn->ephemeral_pubkey) != 0) return -1;
+    if (RAND_bytes(conn->local_nonce, 32) != 1) return -1;
 
-    // 1) ephemeral keypair
-    if (ec_generate_keypair(conn->ephemeral_privkey, conn->ephemeral_pubkey) != 0) {
-        printf("DEBUG: ephemeral key gen failed\n");
+    // 2) sig = sign(ephemeral-privkey, static-shared-secret ^ initiator-nonce)
+    uint8_t shared[32], sign_data[32];
+    if (ec_ecdh(conn->static_privkey, conn->peer_static_pubkey, shared) != 0) return -1;
+    for (int i = 0; i < 32; i++) sign_data[i] = shared[i] ^ conn->local_nonce[i];
+    OPENSSL_cleanse(shared, sizeof(shared));
+
+    uint8_t sig65[65];
+    int recid = 0;
+    if (ec_sign_with_recid(conn->ephemeral_privkey, sign_data, sig65, &recid) != 0) return -1;
+    sig65[64] = (uint8_t)recid;   // RLPx uses the raw recovery id (0/1), not 27+
+
+    // 3) auth-body = rlp[sig, initiator-pubk(64), nonce, vsn=4]
+    const uint8_t* items[4];
+    size_t lens[4];
+    uint8_t vsn = 4;
+    items[0] = sig65;                   lens[0] = 65;
+    items[1] = conn->static_pubkey + 1; lens[1] = 64;
+    items[2] = conn->local_nonce;       lens[2] = 32;
+    items[3] = &vsn;                    lens[3] = 1;
+
+    uint8_t body[1024];
+    size_t body_len = rlp_encode_list(items, lens, 4, body);
+    if (body_len == 0) return -1;
+
+    // EIP-8: append random padding so the packet size is not fixed
+    uint8_t pad_len_byte;
+    if (RAND_bytes(&pad_len_byte, 1) != 1) return -1;
+    size_t pad = 100 + (pad_len_byte % 200);
+    if (RAND_bytes(body + body_len, (int)pad) != 1) return -1;
+    body_len += pad;
+
+    // 4) auth-size (big-endian) is both the prefix and the ECIES shared-mac-data
+    uint16_t size = (uint16_t)(ECIES_OVERHEAD + body_len);
+    uint8_t prefix[2] = { (uint8_t)(size >> 8), (uint8_t)size };
+
+    if (*auth_len < 2u + size) return -1;
+    size_t enc_len = *auth_len - 2;
+    if (ecies_encrypt(conn->peer_static_pubkey, body, body_len, prefix, 2, auth_msg + 2, &enc_len) != 0)
         return -1;
-    }
+    if (enc_len != size) return -1;
 
-    // 2) local nonce (secure)
-    int ur = open("/dev/urandom", O_RDONLY);
-    if (ur >= 0) {
-        if (read(ur, conn->local_nonce, 32) != 32) {
-            close(ur);
-            printf("DEBUG: /dev/urandom read failed\n");
-            return -1;
-        }
-        close(ur);
-    } else {
-        printf("DEBUG: cannot open /dev/urandom\n");
-        return -1;
-    }
-
-    // 3) FIXED: Compute shared secret and sign (shared_secret XOR nonce)
-    uint8_t shared_secret[32];
-    if (ec_ecdh(conn->static_privkey, conn->peer_static_pubkey, shared_secret) != 0) {
-        printf("DEBUG: shared secret ECDH failed\n");
-        return -1;
-    }
-
-    // XOR shared secret with local nonce
-    uint8_t sign_data[32];
-    for (int i = 0; i < 32; i++) {
-        sign_data[i] = shared_secret[i] ^ conn->local_nonce[i];
-    }
-
-    // Sign the XOR result
-    uint8_t sig_rs[64];
-    int recid = -1;
-    if (ec_sign_with_recid(conn->ephemeral_privkey, sign_data, sig_rs, &recid) != 0) {
-        printf("DEBUG: ec_sign_with_recid failed\n");
-        return -1;
-    }
-    uint8_t signature65[65];
-    memcpy(signature65, sig_rs, 64);
-    signature65[64] = (uint8_t)(recid + 27);
-
-    // 4) FIXED: Create ephemeral pubkey hash
-    uint8_t ephemeral_hash[32];
-    keccak256(conn->ephemeral_pubkey + 1, 64, ephemeral_hash); // Skip 0x04 prefix
-
-    // 5) FIXED: build RLP auth body: [sig(65), ephemeral_hash(32), static_pubkey(64), nonce(32), version(4)]
-    const uint8_t* items[5];
-    size_t lens[5];
-    items[0] = signature65; lens[0] = 65;
-    items[1] = ephemeral_hash; lens[1] = 32;
-    items[2] = conn->static_pubkey + 1; lens[2] = 64; // X||Y without prefix
-    items[3] = conn->local_nonce; lens[3] = 32;
-    uint8_t ver = 4;
-    items[4] = &ver; lens[4] = 1;
-
-    uint8_t auth_body[512];
-    size_t body_len = rlp_encode_list(items, lens, 5, auth_body);
-    if (body_len == 0) {
-        printf("DEBUG: rlp_encode_list failed\n");
-        return -1;
-    }
-    printf("DEBUG: RLP body length: %zu\n", body_len);
-
-    // 6) compute expected wire body length (R || IV || C || TAG)
-    //uint16_t wire_body_len = (uint16_t)(65 + 16 + body_len + 32);
-    // R (65) || IV (16) || C (body_len) || TAG (16)
-    //uint16_t wire_body_len = (uint16_t)(65 + 16 + body_len + 16);
-    uint16_t wire_body_len = (uint16_t)(65 + 16 + body_len + 32);
-    uint8_t be_len[2] = { (uint8_t)((wire_body_len >> 8) & 0xff), (uint8_t)(wire_body_len & 0xff) };
-
-    // 7) call ecies_encrypt with AAD = be_len
-    uint8_t enc_tmp[1024];
-    size_t enc_tmp_len = sizeof(enc_tmp);
-    if (ecies_encrypt(conn->peer_static_pubkey, auth_body, body_len, be_len, 2, enc_tmp, &enc_tmp_len) != 0) {
-        printf("DEBUG: ecies_encrypt failed\n");
-        return -1;
-    }
-
-    if (enc_tmp_len != wire_body_len) {
-        printf("DEBUG: Warning enc_tmp_len (%zu) != expected wire_body_len (%u)\n", enc_tmp_len, wire_body_len);
-    }
-
-    // 8) final auth_msg = be_len || enc_tmp
-    if (*auth_len < 2 + enc_tmp_len) {
-        printf("DEBUG: auth_msg buffer too small\n");
-        return -1;
-    }
-    auth_msg[0] = be_len[0];
-    auth_msg[1] = be_len[1];
-    memcpy(auth_msg + 2, enc_tmp, enc_tmp_len);
-    *auth_len = 2 + enc_tmp_len;
-
-    printf("DEBUG: auth total len: %zu (wire body %u)\n", *auth_len, wire_body_len);
+    auth_msg[0] = prefix[0];
+    auth_msg[1] = prefix[1];
+    *auth_len = 2 + enc_len;
     return 0;
 }
 
-int rlpx_process_authack(rlpx_conn_t* conn, const uint8_t* authack_msg, size_t authack_len) {
-    printf("DEBUG: Processing AuthAck len=%zu\n", authack_len);
+// ---------------------------------------------------------------- ack
 
-    uint8_t plain[512];
+int rlpx_process_authack(rlpx_conn_t* conn, const uint8_t* ack_body, size_t ack_len) {
+    uint8_t plain[RLPX_MAX_HANDSHAKE];
     size_t plain_len = sizeof(plain);
-    uint8_t be_len[2] = { (uint8_t)((authack_len >> 8) & 0xff), (uint8_t)(authack_len & 0xff) };
+    uint8_t prefix[2] = { (uint8_t)(ack_len >> 8), (uint8_t)ack_len };
 
-    // decrypt (passing the same AAD)
-    if (ecies_decrypt(conn->static_privkey, authack_msg, authack_len, be_len, 2, plain, &plain_len) != 0) {
-        printf("DEBUG: ecies_decrypt failed\n");
+    if (ecies_decrypt(conn->static_privkey, ack_body, ack_len, prefix, 2, plain, &plain_len) != 0) {
+        fprintf(stderr, "auth-ack: ECIES decryption failed (wrong peer pubkey or our key?)\n");
         return -1;
     }
 
-    // FIXED: Use proper RLP decode
-    if (rlp_decode_authack(plain, plain_len, conn->peer_ephemeral_pubkey, conn->remote_nonce) == 0) {
-        printf("DEBUG: AuthAck decoded successfully\n");
-        return 0;
+    // rlp[recipient-ephemeral-pubk, recipient-nonce, ack-vsn] (+ ignored padding)
+    int is_list;
+    const uint8_t *list, *p;
+    size_t list_len, plen, used;
+    if (rlp_parse(plain, plain_len, &is_list, &list, &list_len) == 0 || !is_list) {
+        fprintf(stderr, "auth-ack: not an RLP list\n");
+        return -1;
     }
+    used = rlp_parse(list, list_len, &is_list, &p, &plen);
+    if (used == 0 || is_list || plen != 64) {
+        fprintf(stderr, "auth-ack: bad ephemeral pubkey\n");
+        return -1;
+    }
+    conn->peer_ephemeral_pubkey[0] = 0x04;
+    memcpy(conn->peer_ephemeral_pubkey + 1, p, 64);
+    list += used; list_len -= used;
 
-    printf("DEBUG: AuthAck decode failed\n");
-    return -1;
+    used = rlp_parse(list, list_len, &is_list, &p, &plen);
+    if (used == 0 || is_list || plen != 32) {
+        fprintf(stderr, "auth-ack: bad nonce\n");
+        return -1;
+    }
+    memcpy(conn->remote_nonce, p, 32);
+    return 0;
 }
 
-void rlpx_derive_secrets(rlpx_conn_t* conn) {
-    printf("DEBUG: Deriving session secrets (RLPx spec compliant)...\n");
+// ---------------------------------------------------------------- secrets
 
-    // 1. ephemeral_shared = ECDH(ephemeral_priv, peer_ephemeral_pub)
-    uint8_t ephemeral_shared[32];
-    if (ec_ecdh(conn->ephemeral_privkey, conn->peer_ephemeral_pubkey, ephemeral_shared) != 0) {
-        printf("DEBUG: ephemeral ECDH failed\n");
-        return;
-    }
+int rlpx_derive_secrets(rlpx_conn_t* conn) {
+    uint8_t ephemeral_key[32], tmp[64], shared_secret[32];
 
-    // 2. shared_secret = keccak(ephemeral_shared || keccak(resp_nonce || init_nonce))
-    uint8_t nonce_hash[32];
-    uint8_t concat_nonce[64];
-    memcpy(concat_nonce, conn->remote_nonce, 32);     // recipient nonce first
-    memcpy(concat_nonce + 32, conn->local_nonce, 32); // initiator nonce second
-    keccak256(concat_nonce, 64, nonce_hash);
+    // ephemeral-key = ecdh(ephemeral-privkey, remote-ephemeral-pubk)
+    if (ec_ecdh(conn->ephemeral_privkey, conn->peer_ephemeral_pubkey, ephemeral_key) != 0) return -1;
 
-    uint8_t shared_input[64];
-    memcpy(shared_input, ephemeral_shared, 32);
-    memcpy(shared_input + 32, nonce_hash, 32);
-    
-    uint8_t shared_secret[32];
-    keccak256(shared_input, 64, shared_secret);
+    // shared-secret = keccak(ephemeral-key || keccak(recipient-nonce || initiator-nonce))
+    memcpy(tmp, conn->remote_nonce, 32);
+    memcpy(tmp + 32, conn->local_nonce, 32);
+    keccak256(tmp, 64, tmp + 32);
+    memcpy(tmp, ephemeral_key, 32);
+    keccak256(tmp, 64, shared_secret);
 
-    // 3. aes_secret = keccak(ephemeral_shared || shared_secret)
-    memcpy(shared_input + 32, shared_secret, 32);
-    keccak256(shared_input, 64, conn->secrets.aes_secret);
+    // aes-secret = keccak(ephemeral-key || shared-secret)
+    memcpy(tmp + 32, shared_secret, 32);
+    keccak256(tmp, 64, conn->secrets.aes_secret);
 
-    // 4. mac_secret = keccak(ephemeral_shared || aes_secret)  
-    memcpy(shared_input + 32, conn->secrets.aes_secret, 32);
-    keccak256(shared_input, 64, conn->secrets.mac_secret);
+    // mac-secret = keccak(ephemeral-key || aes-secret)
+    memcpy(tmp + 32, conn->secrets.aes_secret, 32);
+    keccak256(tmp, 64, conn->secrets.mac_secret);
 
-    // Initialize MAC states
-    memcpy(conn->secrets.ingress_mac, conn->secrets.mac_secret, 32);
-    memcpy(conn->secrets.egress_mac, conn->secrets.mac_secret, 32);
+    // egress-mac  = keccak.init((mac-secret ^ recipient-nonce) || auth)
+    // ingress-mac = keccak.init((mac-secret ^ initiator-nonce) || ack)
+    uint8_t x[32];
+    keccak_init(&conn->egress_mac);
+    for (int i = 0; i < 32; i++) x[i] = conn->secrets.mac_secret[i] ^ conn->remote_nonce[i];
+    keccak_update(&conn->egress_mac, x, 32);
+    keccak_update(&conn->egress_mac, conn->auth_packet, conn->auth_packet_len);
 
-    conn->frame_enc_seed = 0;
-    conn->frame_dec_seed = 0;
+    keccak_init(&conn->ingress_mac);
+    for (int i = 0; i < 32; i++) x[i] = conn->secrets.mac_secret[i] ^ conn->local_nonce[i];
+    keccak_update(&conn->ingress_mac, x, 32);
+    keccak_update(&conn->ingress_mac, conn->ack_packet, conn->ack_packet_len);
 
-    // Clean up temporary secrets
-    OPENSSL_cleanse(ephemeral_shared, sizeof(ephemeral_shared));
+    // AES-256-CTR streams with zero IV, one per direction, plus AES-256-ECB for MAC
+    uint8_t iv[16] = {0};
+    conn->egress_cipher = EVP_CIPHER_CTX_new();
+    conn->ingress_cipher = EVP_CIPHER_CTX_new();
+    conn->mac_cipher = EVP_CIPHER_CTX_new();
+    if (!conn->egress_cipher || !conn->ingress_cipher || !conn->mac_cipher) return -1;
+    if (EVP_EncryptInit_ex(conn->egress_cipher, EVP_aes_256_ctr(), NULL, conn->secrets.aes_secret, iv) != 1) return -1;
+    if (EVP_EncryptInit_ex(conn->ingress_cipher, EVP_aes_256_ctr(), NULL, conn->secrets.aes_secret, iv) != 1) return -1;
+    if (EVP_EncryptInit_ex(conn->mac_cipher, EVP_aes_256_ecb(), NULL, conn->secrets.mac_secret, NULL) != 1) return -1;
+    EVP_CIPHER_CTX_set_padding(conn->mac_cipher, 0);
+
+    OPENSSL_cleanse(ephemeral_key, sizeof(ephemeral_key));
     OPENSSL_cleanse(shared_secret, sizeof(shared_secret));
-    OPENSSL_cleanse(shared_input, sizeof(shared_input));
-    OPENSSL_cleanse(nonce_hash, sizeof(nonce_hash));
-
-    printf("DEBUG: Derived aes/mac secrets (spec compliant)\n");
+    OPENSSL_cleanse(tmp, sizeof(tmp));
+    OPENSSL_cleanse(conn->ephemeral_privkey, 32);
+    return 0;
 }
+
+// ---------------------------------------------------------------- connect
 
 int rlpx_connect(rlpx_conn_t* conn, const char* host, uint16_t port, const char* peer_pubkey_file) {
-    printf("DEBUG: Starting RLPx connection to %s:%u\n", host, port);
-
-    // load peer static pubkey from file (64 bytes X||Y)
-    FILE *f = fopen(peer_pubkey_file, "rb");
-    if (!f) {
-        printf("DEBUG: failed to open peer pubkey file\n");
+    if (rlpx_load_pubkey(peer_pubkey_file, conn->peer_static_pubkey) != 0) {
+        fprintf(stderr, "Could not load peer public key from '%s' (need 64-byte file, 128 hex chars, or enode://)\n",
+                peer_pubkey_file);
         return -1;
     }
-    size_t r = fread(conn->peer_static_pubkey + 1, 1, 64, f);
-    fclose(f);
-    if (r != 64) {
-        printf("DEBUG: peer pubkey wrong size %zu\n", r);
-        return -1;
-    }
-    conn->peer_static_pubkey[0] = 0x04;
-    printf("DEBUG: loaded peer static pubkey\n");
 
     conn->sockfd = net_connect(host, port);
-    if (conn->sockfd < 0) {
-        printf("DEBUG: net_connect failed\n");
-        return -1;
-    }
+    if (conn->sockfd < 0) return -1;
+    conn->state = RLPX_STATE_CONNECTED;
 
-    // Build and send auth
-    uint8_t auth_buf[2048];
-    size_t auth_len = sizeof(auth_buf);
-    if (rlpx_create_auth(conn, auth_buf, &auth_len) != 0) {
-        printf("DEBUG: create_auth failed\n");
-        net_close(conn->sockfd);
-        return -1;
+    // auth
+    conn->auth_packet_len = sizeof(conn->auth_packet);
+    if (rlpx_create_auth(conn, conn->auth_packet, &conn->auth_packet_len) != 0) {
+        fprintf(stderr, "Failed to build auth message\n");
+        goto fail;
     }
-
-    if (net_send_all(conn->sockfd, auth_buf, auth_len) != (ssize_t)auth_len) {
-        printf("DEBUG: failed to send auth\n");
-        net_close(conn->sockfd);
-        return -1;
+    if (net_send_all(conn->sockfd, conn->auth_packet, conn->auth_packet_len) != (ssize_t)conn->auth_packet_len) {
+        fprintf(stderr, "Failed to send auth\n");
+        goto fail;
     }
-    printf("DEBUG: sent auth (%zu bytes): ", auth_len);
-    for (size_t i = 0; i < auth_len && i < 64; i++) printf("%02x", auth_buf[i]);
-    printf("%s\n", auth_len > 64 ? "..." : "");
     conn->state = RLPX_STATE_SENT_AUTH;
 
-    // Read 2-byte BE length
-    uint8_t len_be[2];
-    ssize_t got = net_recv_exact(conn->sockfd, len_be, 2, 10000);
-    if (got != 2) {
-        printf("DEBUG: failed to read authAck length: %zd\n", got);
-        net_close(conn->sockfd);
-        return -1;
+    // ack: 2-byte size prefix then body
+    if (net_recv_exact(conn->sockfd, conn->ack_packet, 2, 10000) != 2) {
+        fprintf(stderr, "Did not receive auth-ack (peer closed? wrong peer pubkey?)\n");
+        goto fail;
     }
-    uint16_t ack_len = (uint16_t)((len_be[0] << 8) | len_be[1]);
-    if (ack_len > sizeof(auth_buf)) {
-        printf("DEBUG: authAck too large %u\n", ack_len);
-        net_close(conn->sockfd);
-        return -1;
+    uint16_t ack_size = (uint16_t)((conn->ack_packet[0] << 8) | conn->ack_packet[1]);
+    if (ack_size < ECIES_OVERHEAD || (size_t)ack_size + 2 > sizeof(conn->ack_packet)) {
+        fprintf(stderr, "auth-ack size %u out of range\n", ack_size);
+        goto fail;
     }
+    if (net_recv_exact(conn->sockfd, conn->ack_packet + 2, ack_size, 10000) != ack_size) {
+        fprintf(stderr, "Short auth-ack\n");
+        goto fail;
+    }
+    conn->ack_packet_len = 2u + ack_size;
+    conn->state = RLPX_STATE_RECV_ACK;
 
-    // Read body
-    ssize_t got_body = net_recv_exact(conn->sockfd, auth_buf, ack_len, 10000);
-    if (got_body != ack_len) {
-        printf("DEBUG: failed to read full authAck: %zd\n", got_body);
-        net_close(conn->sockfd);
-        return -1;
+    if (rlpx_process_authack(conn, conn->ack_packet + 2, ack_size) != 0) goto fail;
+    if (rlpx_derive_secrets(conn) != 0) {
+        fprintf(stderr, "Secret derivation failed\n");
+        goto fail;
     }
-
-    // Process (authAck body only)
-    if (rlpx_process_authack(conn, auth_buf, ack_len) != 0) {
-        printf("DEBUG: process_authack failed\n");
-        net_close(conn->sockfd);
-        return -1;
-    }
-
-    // Derive session secrets
-    rlpx_derive_secrets(conn);
     conn->state = RLPX_STATE_ESTABLISHED;
-    printf("DEBUG: handshake complete\n");
     return 0;
+
+fail:
+    net_close(conn->sockfd);
+    conn->sockfd = -1;
+    conn->state = RLPX_STATE_ERROR;
+    return -1;
 }
 
 void rlpx_close(rlpx_conn_t* conn) {
@@ -301,5 +306,10 @@ void rlpx_close(rlpx_conn_t* conn) {
         net_close(conn->sockfd);
         conn->sockfd = -1;
     }
+    if (conn->egress_cipher)  EVP_CIPHER_CTX_free(conn->egress_cipher);
+    if (conn->ingress_cipher) EVP_CIPHER_CTX_free(conn->ingress_cipher);
+    if (conn->mac_cipher)     EVP_CIPHER_CTX_free(conn->mac_cipher);
+    conn->egress_cipher = conn->ingress_cipher = conn->mac_cipher = NULL;
+    OPENSSL_cleanse(&conn->secrets, sizeof(conn->secrets));
     conn->state = RLPX_STATE_INIT;
 }

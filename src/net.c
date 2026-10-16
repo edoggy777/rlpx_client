@@ -7,6 +7,8 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netdb.h>
+#include <poll.h>
 
 int net_connect(const char* host, uint16_t port) {
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -21,9 +23,17 @@ int net_connect(const char* host, uint16_t port) {
     addr.sin_port = htons(port);
 
     if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
-        fprintf(stderr, "inet_pton() failed for %s\n", host);
-        close(sockfd);
-        return -1;
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) {
+            fprintf(stderr, "could not resolve host %s\n", host);
+            close(sockfd);
+            return -1;
+        }
+        addr.sin_addr = ((struct sockaddr_in*)res->ai_addr)->sin_addr;
+        freeaddrinfo(res);
     }
 
     if (connect(sockfd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
@@ -32,13 +42,25 @@ int net_connect(const char* host, uint16_t port) {
         return -1;
     }
 
-    printf("DEBUG: connected to %s:%u (sockfd=%d)\n", host, port, sockfd);
     return sockfd;
 }
 
 ssize_t net_recv_exact(int sockfd, uint8_t* buf, size_t len, int timeout_ms) {
     size_t total = 0;
     while (total < len) {
+        if (timeout_ms > 0) {
+            struct pollfd pfd = { .fd = sockfd, .events = POLLIN };
+            int pr = poll(&pfd, 1, timeout_ms);
+            if (pr == 0) {
+                fprintf(stderr, "DEBUG: recv timed out after %d ms\n", timeout_ms);
+                return -1;
+            }
+            if (pr < 0) {
+                if (errno == EINTR) continue;
+                perror("poll() failed");
+                return -1;
+            }
+        }
         ssize_t n = recv(sockfd, buf + total, len - total, 0);
         if (n < 0) {
             perror("recv() failed");
