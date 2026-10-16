@@ -2,9 +2,9 @@
 
 If you find this project helpful, consider supporting it:
 
-**Bitcoin:** `338dgCgrg6Sm1UdP6dCdL6BrNiU7NQjkA7`
+**Ethereum:** `0x0CDdCff8f61B45fB2870d8Bd46A2170Af62220A4`
 
-[Donate with Bitcoin](bitcoin:338dgCgrg6Sm1UdP6dCdL6BrNiU7NQjkA7)
+[Donate with Ethereum](Eth:0x0CDdCff8f61B45fB2870d8Bd46A2170Af62220A4)
 
 # Minimal RLPx Client in C
 
